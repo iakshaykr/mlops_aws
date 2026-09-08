@@ -1,0 +1,272 @@
+name: Deploy MLOps API to ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+
+jobs:
+  deploy:
+    environment: production
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      #########################################################
+      # Checkout
+      #########################################################
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      #########################################################
+      # Python
+      #########################################################
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      #########################################################
+      # Install dependencies
+      #########################################################
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      #########################################################
+      # Run tests
+      #########################################################
+
+      - name: Run Unit Tests
+        run: |
+          if [ -d tests ]; then
+            pytest tests/
+          else
+            echo "No tests directory found — skipping tests"
+          fi
+
+      #########################################################
+      # Configure AWS
+      #########################################################
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      #########################################################
+      # Login ECR
+      #########################################################
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      #########################################################
+      # Build Docker
+      #########################################################
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t $ECR_REPOSITORY:${{ github.sha }} .
+
+      #########################################################
+      # Tag Docker
+      #########################################################
+
+      - name: Tag Docker Image
+        run: |
+          docker tag \
+            $ECR_REPOSITORY:${{ github.sha }} \
+            ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+
+      #########################################################
+      # Push Docker
+      #########################################################
+
+      - name: Push Docker Image
+        run: |
+          docker push \
+            ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+
+      #########################################################
+      # Download Current ECS Task Definition
+      #########################################################
+
+      - name: Download ECS Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition mlops-task \
+            --query taskDefinition \
+            > task-definition.json
+
+      #########################################################
+      # Update Image in Task Definition
+      #########################################################
+
+      - name: Render ECS Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Get Current Task Definition
+        id: current-task
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query "services[0].taskDefinition" \
+            --output text)
+
+          echo "CURRENT_TASK=$TASK_DEF" >> $GITHUB_ENV
+          echo "Current task definition: $TASK_DEF"
+
+      #########################################################
+      # Deploy ECS
+      #########################################################
+
+      - name: Deploy to Amazon ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      #########################################################
+      # Health Check
+      #########################################################
+
+      - name: Get ECS Task Public IP
+        id: get-public-ip
+        run: |
+          CLUSTER="${{ env.ECS_CLUSTER }}"
+          SERVICE="${{ env.ECS_SERVICE }}"
+          REGION="${{ env.AWS_REGION }}"
+
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster "$CLUSTER" \
+            --service-name "$SERVICE" \
+            --region "$REGION" \
+            --query 'taskArns[0]' \
+            --output text)
+
+          echo "Task ARN: $TASK_ARN"
+
+          CONTAINER_INSTANCE_ARN=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --region "$REGION" \
+            --query 'tasks[0].containerInstanceArn' \
+            --output text)
+
+          echo "Container Instance ARN: $CONTAINER_INSTANCE_ARN"
+
+          if [ -z "$CONTAINER_INSTANCE_ARN" ] || [ "$CONTAINER_INSTANCE_ARN" = "None" ]; then
+            ENI_ID=$(aws ecs describe-tasks \
+              --cluster "$CLUSTER" \
+              --tasks "$TASK_ARN" \
+              --region "$REGION" \
+              --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+              --output text)
+
+            if [ -z "$ENI_ID" ] || [ "$ENI_ID" = "None" ]; then
+              echo "ERROR: no network interface found for task $TASK_ARN"
+              exit 1
+            fi
+
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+              --network-interface-ids "$ENI_ID" \
+              --region "$REGION" \
+              --query 'NetworkInterfaces[0].Association.PublicIp' \
+              --output text)
+
+            PRIVATE_IP=$(aws ec2 describe-network-interfaces \
+              --network-interface-ids "$ENI_ID" \
+              --region "$REGION" \
+              --query 'NetworkInterfaces[0].PrivateIpAddress' \
+              --output text)
+
+            echo "Fargate task IPs: public=$PUBLIC_IP private=$PRIVATE_IP"
+            echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          else
+            INSTANCE_ID=$(aws ecs describe-container-instances \
+              --cluster "$CLUSTER" \
+              --container-instances "$CONTAINER_INSTANCE_ARN" \
+              --region "$REGION" \
+              --query 'containerInstances[0].ec2InstanceId' \
+              --output text)
+
+            PUBLIC_IP=$(aws ec2 describe-instances \
+              --instance-ids "$INSTANCE_ID" \
+              --region "$REGION" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+
+            echo "EC2 task public IP: $PUBLIC_IP"
+            echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test - simple curl to deployed API
+        run: |
+         PUBLIC_IP="${{ steps.get-public-ip.outputs.public_ip }}"
+         curl -sS --fail -X POST "http://$PUBLIC_IP:8000/predict" \
+         -H "accept: application/json" \
+         -H "Content-Type: application/json" \
+         -d '{"city":"Bangalore","area":0,"bedrooms":0,"bathrooms":0,"house_age":0,"parking":true}'
+
+      #########################################################
+      # Health Check
+      #########################################################
+
+      - name: Verify Health Endpoint
+        run: |
+          sleep 30
+
+          PUBLIC_IP="${{ steps.get-public-ip.outputs.public_ip }}"
+
+          if [ "$PUBLIC_IP" != "None" ] && [ -n "$PUBLIC_IP" ]; then
+            echo "Testing API at http://$PUBLIC_IP:8000/health"
+            curl -v --fail "http://$PUBLIC_IP:8000/health"
+          else
+            echo "⚠️ Warning: Could not retrieve public IP. Skipping health check."
+            echo "You can manually test the API once the task is running."
+          fi
+
+      - name: Rollback
+        if: failure()
+        run: |
+          echo "Rolling back..."
+
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $CURRENT_TASK
+
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+          echo "Rollback completed."
